@@ -3,16 +3,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import sys
 import os 
+import time
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 import torch
 import torchvision
+from torchvision import models
 import torchvision.transforms as transforms
 from torch.autograd import Variable
 import torch.nn as nn 
 import torch.nn.functional as F
 import torch.optim as optim
-
+from torch.utils.tensorboard import SummaryWriter
 
 from sklearn import svm, datasets
 from sklearn.metrics import roc_curve, auc
@@ -32,7 +34,7 @@ test_images = np.vstack((f_s["test_images"][:], f_b["test_images"][:]))
 test_labels = np.hstack((f_s["test_labels"][:], f_b["test_labels"][:]))
 val_images = np.vstack((f_s["val_images"][:], f_b["val_images"][:]))
 val_labels = np.hstack((f_s["val_labels"][:], f_b["val_labels"][:]))
-
+classes = {0:'di-higgs',1:'ttbar'}
 train_labels.astype(int)
 test_labels.astype(int)
 val_labels.astype(int)
@@ -72,24 +74,74 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+def matplotlib_imshow(img, one_channel=False):
+    if one_channel:
+        img = img.mean(dim=0)
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.cpu().numpy()
+    if one_channel:
+        plt.imshow(npimg, cmap="Greys")
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
 
+def images_to_probs(net, images):
+    output = net(images)
+    _, preds_tensor= torch.max(output,1)
+    preds = np.squeeze(preds_tensor.cpu().numpy())
+    return preds, [F.softmax(el, dim=0)[i].item() for i, el in zip(preds, output)]
 
-net = Net()
-net.cuda()
+def plot_classes_preds(net, images, labels):
+    preds, probs = images_to_probs(net, images)
+    fig = plt.figure(figsize=(12, 48))
+    for idx in np.arange(4):
+        ax = fig.add_subplot(1,4,idx+1, xticks=[], yticks=[])
+        matplotlib_imshow(images[idx], one_channel=True)
+        ax.set_title("{0}, {1:.1f}%\n(label: {2})".format(
+        classes[preds[idx]],
+               probs[idx]*100.0,
+               classes[int(labels[idx])]),
+                    color=('green' if preds[idx]==labels[idx].long() else "red"))
+    return fig
 
-criterion = nn.CrossEntropyLoss()
+from datetime import datetime
+now = datetime.now()
+logdir = "runs/" + now.strftime("%Y%m%d-%H%M%S") + "/"
+writer = SummaryWriter(logdir)
+
+#net = Net()
+#net.cuda()
+
+net = models.resnet18(pretrained=False)
+net.conv1 = nn.Conv2d(5,64, kernel_size=(7,7),stride=(2,2),padding=(3,3), bias=False)
+num_ftrs = net.fc.in_features
+net.fc = nn.Linear(num_ftrs, 2)
+net = net.cuda()
+
+since = time.time()
+learning_rate = 0.001
 optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-for epoch in range(2):  
-    running_loss = 0.0
-    for phase in ['train', 'val']:
+exp_lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+criterion = nn.CrossEntropyLoss()
+model_wts = net.state_dict()
+best_acc = 0.0
+losses = {'train':[],'valid':[]}
+accuracy = {'train':[],'valid':[]}
+num_epochs = 20
+for epoch in range(num_epochs): 
+    print("Epoch {}/{}".format(epoch, num_epochs-1))
+    print('-'*10)
+    for phase in ['train', 'valid']:
       if phase =='train':
           net.train()
-          phase = trainloader
+          loader = trainloader
       else:
           net.eval()
-          phase = valloader
-
-      for i, data in enumerate(phase, 0):
+          loader = valloader
+      running_loss = 0.0
+      running_corrects= 0
+      ep_running_loss = 0.0
+      ep_running_corrects = 0
+      for i, data in enumerate(loader, 0):
           inputs, labels = data
 
           inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
@@ -98,17 +150,70 @@ for epoch in range(2):
           optimizer.zero_grad()
 
           outputs = net(inputs)
+          _, preds = torch.max(outputs.data, 1)
           loss = criterion(outputs, labels.long())
-          loss.backward()
-          optimizer.step()
+          if phase=='train':
+              loss.backward()
+              optimizer.step()
 
           running_loss += loss.data
-          if i % 1000 == 999:    # print every 2000 mini-batches
+          ep_running_loss += loss.data
+          running_corrects += torch.sum(preds==labels.long())
+          ep_running_corrects += torch.sum(preds==labels.long())
+          if i % 100 == 99:    # print every 100 mini-batches
+              '''
               print('[%d, %5d]  loss: %.3f' %
-                    (epoch + 1, i + 1, running_loss / 1000))
+                    (epoch + 1, i + 1, running_loss / 100))
               running_loss = 0.0
-
+              print('[%d, %5d]  Accuracy: %.3f' %
+                    (epoch + 1, i + 1, float(running_corrects)/(100.0*4.0)))
+              running_corrects = 0.0
+              '''
+              writer.add_scalar('{} loss'.format(phase),
+                                     running_loss/100,
+                                     epoch*len(loader)+i)
+              writer.add_scalar('{} Accuracy'.format(phase),
+                               float(running_corrects)/(100.0*4.0),
+                               epoch*len(loader)+i)
+              writer.add_figure('predictions vs actuals, {}'.format(phase),
+                               plot_classes_preds(net, inputs, labels),
+                               global_step=epoch*len(loader)+i)
+              running_loss = 0.0
+              running_corrects = 0.0
+      epoch_loss = ep_running_loss/(len(loader)*4)
+      epoch_acc = float(ep_running_corrects)/(len(loader)*4)
+      losses[phase].append(epoch_loss)
+      accuracy[phase].append(epoch_acc)
+      print('{} Loss: {:.4f}, Acc : {:.4f}'.format( phase, epoch_loss, epoch_acc))    
+      if phase=='valid' and epoch_acc>best_acc:
+          best_acc = epoch_acc
+          best_model_wts = net.state_dict()  
+time_elapsed = time.time() - since
+print("Training complete in {:.0f}s".format(time_elapsed//60, time_elapsed%60))
+print("Best Acc: {:4f}".format(best_acc))
+net.load_state_dict(best_model_wts)
 print('Finished Training')
+
+def plottingLossAcc(losses,accuracy,datatype):
+  # plotting losses, and accuracy
+    plt.plot(range(1,len(losses)+1),losses, 'r',label='loss')
+    plt.title('{} Losses'.format(datatype.capitalize()))
+    plt.xlabel('epoch')
+    plt.ylabel('losses')
+    plt.legend()
+    plt.savefig("plots/{}_loss.png".format(datatype))
+    plt.show()
+
+    plt.plot(range(1,len(accuracy)+1), accuracy, 'r', label='accuracy')
+    plt.title('{} Accuracy'.format(datatype.capitalize()))
+    plt.xlabel('epoch')
+    plt.ylabel('accuracy')
+    plt.legend()
+    plt.savefig("plots/{}_accuracy.png".format(datatype))
+    plt.show()
+
+plottingLossAcc(losses['train'],accuracy['train'],'train')
+plottingLossAcc(losses['valid'],accuracy['valid'],'valid')
 
 correct = 0
 total = 0
